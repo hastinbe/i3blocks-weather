@@ -1,0 +1,345 @@
+#!/bin/bash
+#
+#  i3blocks-weather
+#
+#  Display weather information from wttr.in for i3blocks.
+#
+#  Dependencies: curl rofi jq
+#
+#  Copyright (c) 2024 Beau Hastings. All rights reserved.
+#  License: GNU General Public License v2
+#
+#  Author: Beau Hastings <beau@saweet.net>
+#  URL: https://github.com/hastinbe/i3blocks-weather
+
+define_helpers() {
+    empty() { [[ -z $1 ]]; }
+    not_empty() { [[ -n $1 ]]; }
+    command_exists() { command -v "$1" &>/dev/null; }
+    debug() { [[ $DEBUG -eq 1 ]] && echo "DEBUG: $*" >&2; }
+    log_error() { echo "ERROR: $*" >&2; }
+}
+
+load_config() {
+    local -r config=${XDG_CONFIG_HOME:-$HOME/.config}/i3blocks-weather/config
+    # shellcheck source=/dev/null
+    [[ -f $config ]] && source "$config"
+}
+
+convert_i3_to_rofi_font() {
+    local i3_font="$1"
+
+    # Check if the input starts with "pango:", if so, remove it
+    if [[ "$i3_font" == pango:* ]]; then
+        i3_font="${i3_font#pango:}"
+    fi
+
+    # Remove any commas from the font description
+    local -r rofi_font="${i3_font//,/}"
+
+    echo "$rofi_font"
+}
+
+fetch_weather_data() {
+    local fetch_new=0
+    local weather_data=""
+    local cache_age
+
+    if [ -f "$CACHE_FILE" ]; then
+        # Get cache file age in seconds
+        cache_age=$(($(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)))
+
+        if [ "$cache_age" -gt "$CACHE_DURATION" ]; then
+            fetch_new=1
+        else
+            # Read from cache
+            weather_data=$(cat "$CACHE_FILE")
+        fi
+    else
+        fetch_new=1
+    fi
+
+    # Fetch new data if needed
+    if [ $fetch_new -eq 1 ]; then
+        # -s for silent, -H 'Accept-Charset: UTF-8' helps ensure the wind arrow is correct
+        # If LOCATION is empty, wttr.in will auto-detect based on IP
+        if [ -z "$LOCATION" ]; then
+            weather_data=$(curl -s -H 'Accept-Charset: UTF-8' "https://wttr.in/?$UNITS&format=$FORMAT")
+        else
+            weather_data=$(curl -s -H 'Accept-Charset: UTF-8' "https://wttr.in/$LOCATION?$UNITS&format=$FORMAT")
+        fi
+        debug "Raw weather data: '$weather_data'"
+
+        # Only update cache if we got valid data
+        if [ -n "$weather_data" ]; then
+            echo "$weather_data" > "$CACHE_FILE"
+        elif [ -f "$CACHE_FILE" ]; then
+            # If fetch failed but we have old cache, use it
+            weather_data=$(cat "$CACHE_FILE")
+        fi
+    fi
+
+    echo "$weather_data"
+}
+
+fetch_popup_weather_data() {
+    local fetch_new=0
+    local weather_report=""
+    local cache_age
+
+    if [ -f "$POPUP_CACHE_FILE" ]; then
+        # Get cache file age in seconds
+        cache_age=$(($(date +%s) - $(stat -c %Y "$POPUP_CACHE_FILE" 2>/dev/null || echo 0)))
+
+        if [ "$cache_age" -gt "$CACHE_DURATION" ]; then
+            fetch_new=1
+        else
+            # Read from cache
+            weather_report=$(cat "$POPUP_CACHE_FILE")
+        fi
+    else
+        fetch_new=1
+    fi
+
+    # Fetch new data if needed
+    if [ $fetch_new -eq 1 ]; then
+        # Fetch the full ASCII weather report
+        # If LOCATION is empty, wttr.in will auto-detect based on IP
+        if [ -z "$LOCATION" ]; then
+            weather_report=$(curl -s "https://wttr.in/?T&Q&$UNITS")
+        else
+            weather_report=$(curl -s "https://wttr.in/$LOCATION?T&Q&$UNITS")
+        fi
+
+        # Only update cache if we got valid data
+        if [ -n "$weather_report" ]; then
+            echo "$weather_report" > "$POPUP_CACHE_FILE"
+        elif [ -f "$POPUP_CACHE_FILE" ]; then
+            # If fetch failed but we have old cache, use it
+            weather_report=$(cat "$POPUP_CACHE_FILE")
+        fi
+    fi
+
+    echo "$weather_report"
+}
+
+parse_weather_data() {
+    local weather_data="$1"
+
+    # Parse using + as separator
+    TEMPERATURE=$(echo "$weather_data" | awk -F'+' '{print $1}' | xargs)
+    WIND=$(echo "$weather_data" | awk -F'+' '{print $2}' | xargs)
+    CONDITION_CODE=$(echo "$weather_data" | awk -F'+' '{print $3}' | xargs)
+    HUMIDITY=$(echo "$weather_data" | awk -F'+' '{print $4}' | xargs)
+
+    debug "Temperature: $TEMPERATURE"
+    debug "Wind: $WIND"
+    debug "Condition: $CONDITION_CODE"
+    debug "Humidity: $HUMIDITY"
+}
+
+get_weather_icon_color() {
+    local icon="$CONDITION_CODE"
+    local color="#ffffff" # Default White
+
+    case "$CONDITION_CODE" in
+        "☀️") color="#FFCC66";; # Sun
+        "🌤️"|"⛅"|"🌥️") color="#ADD8E6";; # Clouds
+        "🌦️"|"🌧️"|"⛈️") color="#4169E1";; # Rain
+        "❄️"|"🌨️") color="#E0FFFF";; # Snow
+        "🌫️") color="#D3D3D3";; # Fog/Mist
+        *) icon="";;
+    esac
+
+    ICON="$icon"
+    COLOR="$color"
+}
+
+display_weather() {
+    # Add label if it exists
+    if not_empty "$LABEL"; then
+        echo -n "$LABEL"
+    fi
+
+    # Full format (first line)
+    echo "$ICON $TEMPERATURE $WIND 💧$HUMIDITY"
+    # Short format (second line)
+    echo "$TEMPERATURE"
+    # Color (optional third line, if set in i3blocks config)
+    if not_empty "$COLOR"; then
+        echo "$COLOR"
+    fi
+}
+
+show_weather_popup() {
+    trap "killall rofi" EXIT
+
+    # Fetch the cached ASCII weather report
+    local weather_report
+    weather_report=$(fetch_popup_weather_data)
+
+    # Determine the number of lines for rofi height
+    local lines
+    lines=$(echo "$weather_report" | wc -l)
+
+    local location_display="${LOCATION:-your location}"
+    debug "Showing weather popup for $location_display"
+    debug "Weather report lines: $lines"
+
+    while true; do
+        echo "$weather_report" | rofi \
+            -dmenu \
+            -font "$FONT" \
+            -markup-rows \
+            -location 0 \
+            -p "Weather for $location_display" \
+            -theme "$ROFI_CONFIG_FILE" \
+            -theme-str "
+                * {
+                    background-color: $WEATHER_BG;
+                    text-color: $WEATHER_FG;
+                }
+                window {
+                    padding: 10px;
+                    width: $ROFI_WIDTH;
+                    location: 0;
+                }
+                listview {
+                    lines: $lines;
+                    scrollbar: true;
+                    cycle: true;
+                }" \
+            "${ROFI_WEATHER_OPTIONS[@]}"
+
+        rofi_exit_code=$?
+        if [ $rofi_exit_code -eq 1 ]; then
+            debug "Exiting weather popup"
+            display_weather
+            return
+        fi
+
+        case $rofi_exit_code in
+            * ) display_weather; return ;; # Any other key (including Enter)
+        esac
+    done
+
+    trap - EXIT
+}
+
+check_dependencies() {
+    local -ra dependencies=("curl" "rofi" "jq")
+    local missing=0
+
+    for dep in "${dependencies[@]}"; do
+        if ! command_exists "$dep"; then
+            log_error "Error: $dep not found, check your PATH environment variable."
+            missing=1
+        fi
+        debug "Found $dep"
+    done
+
+    [[ $missing -eq 1 ]] && exit "$EX_UNAVAILABLE"
+}
+
+load_bar_config() {
+    local bar_config
+    if not_empty "$BAR_ID"; then
+        bar_config=$(i3-msg -t get_bar_config "$BAR_ID")
+    else
+        bar_config=$(i3-msg -t get_bar_config "$(i3-msg -t get_bar_config | jq -r '.[]' | head -n 1)")
+    fi
+
+    empty "$FONT" && FONT=$(convert_i3_to_rofi_font "$(echo "$bar_config" | jq -r '.font')")
+    empty "$WEATHER_BG" && WEATHER_BG=$(echo "$bar_config" | jq -r '.colors.background')
+    empty "$WEATHER_FG" && WEATHER_FG=$(echo "$bar_config" | jq -r '.colors.statusline')
+
+    debug "Loaded bar config: $bar_config"
+    debug "Font: $FONT"
+    debug "Weather BG: $WEATHER_BG"
+    debug "Weather FG: $WEATHER_FG"
+}
+
+check_lock() {
+    debug "Checking for lock file $LOCK_FILE"
+    if [ -f "$LOCK_FILE" ]; then
+        if kill -0 "$(cat "$LOCK_FILE")" 2>/dev/null; then
+            return 1
+        fi
+        rm "$LOCK_FILE"
+    fi
+    echo $$ > "$LOCK_FILE"
+    return 0
+}
+
+# shellcheck disable=SC2317  # Function is invoked via trap, not directly
+cleanup() {
+    rm -f "$LOCK_FILE"
+    debug "Cleaning up lock file $LOCK_FILE"
+    # Kill rofi processes spawned by this script
+    pkill -P "$SCRIPT_PID" rofi 2>/dev/null
+    debug "Killed rofi processes"
+}
+
+# Initialize script
+SCRIPT_PID=$$
+LOCK_FILE="/tmp/weather-wttr-${USER}.lock"
+
+# Exit codes
+readonly EX_OK=0 EX_UNAVAILABLE=69 EX_CANTCREAT=73
+
+# Set up cleanup trap early
+trap cleanup EXIT INT TERM
+
+# Define helpers first
+define_helpers
+
+# Load configuration file
+load_config
+
+# Set defaults if not defined in config
+LOCATION="${LOCATION:-}"  # Empty = auto-detect based on IP
+FORMAT="${FORMAT:-%t+%w+%c+%h}"
+UNITS="${UNITS:-u}"
+CACHE_FILE="${CACHE_FILE:-/tmp/weather-wttr-cache.txt}"
+POPUP_CACHE_FILE="${POPUP_CACHE_FILE:-/tmp/weather-wttr-popup-cache.txt}"
+CACHE_DURATION="${CACHE_DURATION:-900}"
+DEBUG="${DEBUG:-0}"
+
+# i3blocks variables
+LABEL="${LABEL:-}"
+COLOR="${COLOR:-}"
+BLOCK_BUTTON="${BLOCK_BUTTON:-}"
+
+# Basic display settings (with defaults)
+BAR_ID="${BAR_ID:-}"
+ROFI_CONFIG_FILE="${ROFI_CONFIG_FILE:-/dev/null}"
+ROFI_WIDTH="${ROFI_WIDTH:-65%}"
+ROFI_LOCATION="${ROFI_LOCATION:-northwest}"
+
+# Keyboard shortcuts (using Alt instead of Ctrl to avoid conflicts)
+ROFI_WEATHER_OPTIONS=()
+
+# Check dependencies
+check_dependencies
+
+# Check for lock
+if ! check_lock; then
+    log_error "Another instance is already running."
+    exit "$EX_CANTCREAT"
+fi
+
+# Load bar configuration
+load_bar_config
+
+# Fetch and parse weather data
+weather_data=$(fetch_weather_data)
+parse_weather_data "$weather_data"
+get_weather_icon_color
+
+# Handle click events
+case "$BLOCK_BUTTON" in
+    1) show_weather_popup ;;  # Left click - Show weather popup
+    *) display_weather ;;
+esac
+
+exit "$EX_OK"
